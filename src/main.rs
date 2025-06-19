@@ -76,7 +76,12 @@ fn main() -> Result<()> {
 
         let extracted_files = get_files_in_dir(&output_dir)?;
         // 步骤6：删除原始压缩包
-        if extracted_files.len() > 1 || extracted_files.is_empty() {
+        let has_dirs = fs::read_dir(&output_dir)?
+            .any(|entry| entry.ok()
+            .map(|e| e.path().is_dir())
+            .unwrap_or(false));
+            
+        if extracted_files.len() > 1 || extracted_files.is_empty() || has_dirs {
             fs::remove_file(&current_file)
             .context("删除原始压缩文件失败")?;
             println!("已删除原始文件: {:?}", current_file);
