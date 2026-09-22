@@ -1,12 +1,17 @@
 use anyhow::{anyhow, Result};
 use anyhow::Context;
 use std::{
-    ffi::OsStr,
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
 };
+
+mod file_check;
+mod file_convert;
+use crate::file_check::*;
+use crate::file_convert::*;
+
 
 /// 主函数：解析参数并启动解压流程
 fn main() -> Result<()> {
@@ -47,20 +52,20 @@ fn main() -> Result<()> {
             // 步骤3：需要密码时处理逻辑
             // 先尝试无密码解压
             if test_password(&current_file, "")? {
-            None
+                None
             } else if let Some(pwd) = &temp_password {
-            // 尝试临时密码
-            if test_password(&current_file, pwd)? {
-                Some(pwd.clone())
+                // 尝试临时密码
+                if test_password(&current_file, pwd)? {
+                    Some(pwd.clone())
+                } else {
+                    // 临时密码无效时请求用户输入
+                    println!("临时密码无效");
+                    get_password(&current_file, Some(pwd))?
+                }
             } else {
-                // 临时密码无效时请求用户输入
-                println!("临时密码无效");
-                get_password(&current_file, Some(pwd))?
-            }
-            } else {
-            // 无临时密码时请求用户输入
-            println!("压缩包需要密码");
-            get_password(&current_file, None)?
+                // 无临时密码时请求用户输入
+                println!("压缩包需要密码");
+                get_password(&current_file, None)?
             }
         } else {
             None
@@ -82,8 +87,7 @@ fn main() -> Result<()> {
             .unwrap_or(false));
             
         if extracted_files.len() > 1 || extracted_files.is_empty() || has_dirs {
-            fs::remove_file(&current_file)
-            .context("删除原始压缩文件失败")?;
+            fs::remove_file(&current_file).context("删除原始压缩文件失败")?;
             println!("已删除原始文件: {:?}", current_file);
         }
 
@@ -100,21 +104,6 @@ fn main() -> Result<()> {
 
     println!("解压流程完成");
     Ok(())
-}
-
-/// 判断是否为支持的压缩文件格式
-fn is_archive_file(path: &Path) -> bool {
-    let ext = path.extension().and_then(OsStr::to_str).unwrap_or("");
-    matches!(
-        ext.to_lowercase().as_str(),
-        "zip" | "rar" | "7z" | "r00" | "z01" | "001" | "part1.rar" | "zip.001"
-    )
-}
-
-/// 判断是否为图片文件
-fn is_image_file(path: &Path) -> bool {
-    let ext = path.extension().and_then(OsStr::to_str).unwrap_or("");
-    matches!(ext.to_lowercase().as_str(), "png" | "jpg" | "jpeg" | "psd")
 }
 
 /// 检查压缩包是否需要密码
@@ -190,19 +179,4 @@ fn get_files_in_dir(dir: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(files)
-}
-
-/// 将图片文件转换为压缩包
-fn convert_to_archive(image_path: &Path) -> Result<PathBuf> {
-    let archive_path = image_path.with_extension("").with_extension("rar");
-    fs::rename(image_path, &archive_path).context("重命名文件失败")?;
-    
-    // 添加原始文件名前缀（流程图要求）
-    let final_path = archive_path
-        .parent()
-        .unwrap()
-        .join(format!("uc_{}", archive_path.file_name().unwrap().to_string_lossy()));
-    fs::rename(&archive_path, &final_path).context("添加前缀失败")?;
-
-    Ok(final_path)
 }
