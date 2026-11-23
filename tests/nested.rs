@@ -152,3 +152,66 @@ fn removes_only_the_rar_volumes_used_by_a_successful_extraction() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn extracts_7z_volumes_directly_and_inside_another_archive() {
+    let root = test_root();
+    let source = root.join("source");
+    let volumes = root.join("volumes");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&volumes).unwrap();
+    let payload = vec![b'x'; 640];
+    fs::write(source.join("payload.bin"), &payload).unwrap();
+    let result = Command::new("7z")
+        .current_dir(&source)
+        .args(["a", "-t7z", "-mx=0", "-v256b"])
+        .arg(volumes.join("bundle.7z"))
+        .arg("payload.bin")
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{result:?}");
+    let volume_count = fs::read_dir(&volumes).unwrap().count();
+    assert!(volume_count >= 3);
+    let names: Vec<_> = (1..=volume_count)
+        .map(|number| format!("bundle.7z.{number:03}"))
+        .collect();
+    let entries: Vec<_> = names.iter().map(String::as_str).collect();
+    let wrapper = root.join("wrapper.zip");
+    zip(&volumes, &wrapper, &entries);
+    let extract = |archive: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_unzip_tool"))
+            .arg(archive)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+
+    let first = volumes.join(&names[0]);
+    let second = volumes.join(&names[1]);
+    let removed = root.join("missing-volume");
+    fs::rename(&second, &removed).unwrap();
+    let result = extract(&first);
+    assert!(!result.status.success(), "{result:?}");
+    assert!(names
+        .iter()
+        .enumerate()
+        .all(|(index, name)| { index == 1 || volumes.join(name).is_file() }));
+    assert!(!volumes.join("payload.bin").exists());
+    fs::rename(&removed, &second).unwrap();
+
+    let trailing = volumes.join(format!("bundle.7z.{:03}", volume_count + 1));
+    fs::write(&trailing, b"unrelated data").unwrap();
+    let result = extract(&first);
+    assert!(result.status.success(), "{result:?}");
+    assert_eq!(fs::read(volumes.join("payload.bin")).unwrap(), payload);
+    assert!(names.iter().all(|name| !volumes.join(name).exists()));
+    assert_eq!(fs::read(trailing).unwrap(), b"unrelated data");
+
+    let result = extract(&wrapper);
+    assert!(result.status.success(), "{result:?}");
+    assert_eq!(fs::read(root.join("payload.bin")).unwrap(), payload);
+    assert!(names.iter().all(|name| !root.join(name).exists()));
+    assert!(!wrapper.exists());
+
+    fs::remove_dir_all(root).unwrap();
+}

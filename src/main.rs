@@ -9,7 +9,7 @@ use std::{
 };
 
 mod file_check;
-use crate::file_check::{is_archive_file, is_image_file, rar_volume_name};
+use crate::file_check::{is_archive_file, is_first_7z_volume, is_image_file, rar_volume_name};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -47,8 +47,8 @@ fn unpack_archive(
     work_dir: &Path,
     cached_password: &mut Option<String>,
 ) -> Result<()> {
-    let (input, originals) = prepare_rar_volumes(archive, work_dir)?;
-    let Some(info) = inspect_archive(&input, None)
+    let (input, mut originals) = prepare_rar_volumes(archive, work_dir)?;
+    let Some(mut info) = inspect_archive(&input, None)
         .with_context(|| format!("检查原始压缩包失败: {:?}", archive))?
     else {
         return Ok(());
@@ -62,20 +62,19 @@ fn unpack_archive(
         None
     };
 
-    let volume_count = if originals.len() > 1 {
-        let count = match info.volumes {
-            Some(count) => count,
-            None => inspect_archive(&input, password.as_deref())?
-                .and_then(|info| info.volumes)
-                .context("无法确认 RAR 分卷数")?,
-        };
-        if count == 0 || count > originals.len() {
-            return Err(anyhow!("7-Zip 报告的 RAR 分卷数与工作目录不符"));
+    if originals.len() > 1 || is_first_7z_volume(archive) {
+        if info.volumes.is_none() {
+            info = inspect_archive(&input, password.as_deref())?.context("无法确认分卷数")?;
         }
-        count
-    } else {
-        1
-    };
+        let count = info.volumes.context("无法确认分卷数")?;
+        if let Some(archive_end) = info.split_7z_end {
+            originals = split_7z_originals(archive, count, archive_end)?;
+        } else if count == 0 || count > originals.len() {
+            return Err(anyhow!("7-Zip 报告的 RAR 分卷数与工作目录不符"));
+        } else {
+            originals.truncate(count);
+        }
+    }
 
     let output_dir = create_available_dir(&work_dir.join("layer"))?;
     extract_archive(&input, &output_dir, password.as_deref())
@@ -85,12 +84,32 @@ fn unpack_archive(
     }
     unpack_directory(&output_dir, work_dir, cached_password)?;
     publish_contents(&output_dir, archive)?;
-    for original in originals.iter().take(volume_count).rev() {
+    for original in originals.iter().rev() {
         fs::remove_file(original)
             .with_context(|| format!("删除原始压缩文件失败: {:?}", original))?;
         println!("已删除原始文件: {:?}", original);
     }
     Ok(())
+}
+
+fn split_7z_originals(archive: &Path, count: usize, archive_end: u64) -> Result<Vec<PathBuf>> {
+    let mut originals = Vec::new();
+    let mut remaining = archive_end;
+    for number in 1..=count {
+        let path = archive.with_extension(format!("{number:03}"));
+        let metadata =
+            fs::symlink_metadata(&path).with_context(|| format!("无法读取 7z 分卷: {:?}", path))?;
+        if !metadata.is_file() {
+            return Err(anyhow!("7z 分卷不是普通文件: {:?}", path));
+        }
+        remaining = remaining.saturating_sub(metadata.len());
+        originals.push(path);
+        // Split 会计入所有连续编号的文件，跳过完全位于压缩包末尾之后的文件。
+        if remaining == 0 {
+            return Ok(originals);
+        }
+    }
+    Err(anyhow!("7z 分卷的总长度不足: {:?}", archive))
 }
 
 fn prepare_rar_volumes(archive: &Path, work_dir: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
@@ -169,6 +188,7 @@ fn unpack_directory(
 struct ArchiveInfo {
     encrypted: bool,
     volumes: Option<usize>,
+    split_7z_end: Option<u64>,
 }
 
 // 普通图片不是待解压文件，用 None 表示。
@@ -183,29 +203,55 @@ fn inspect_archive(archive: &Path, password: Option<&str>) -> Result<Option<Arch
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     if output.status.success() {
-        let properties: Vec<_> = stdout
-            .lines()
-            .skip_while(|line| *line != "--")
-            .skip(1)
-            .take_while(|line| !line.is_empty() && *line != "----------")
+        let mut headers = stdout.lines().skip_while(|line| *line != "--").skip(1);
+        let properties: Vec<_> = headers
+            .by_ref()
+            .take_while(|line| !line.is_empty() && !matches!(*line, "----" | "----------"))
             .collect();
         let rar_volumes = properties.contains(&"Multivolume = +")
             && properties
                 .iter()
                 .any(|line| matches!(*line, "Type = Rar" | "Type = Rar5"));
-        let count = if rar_volumes {
+        let split_7z_end = if is_first_7z_volume(archive) && properties.contains(&"Type = Split") {
+            let inner: Vec<_> = headers
+                .take_while(|line| *line != "----------")
+                .skip_while(|line| *line != "--")
+                .skip(1)
+                .take_while(|line| !line.is_empty() && *line != "----")
+                .collect();
+            if inner.contains(&"Type = 7z") {
+                let size: u64 = inner
+                    .iter()
+                    .find_map(|line| line.strip_prefix("Physical Size = "))
+                    .context("7-Zip 未报告 7z 压缩包大小")?
+                    .parse()?;
+                let offset: u64 = inner
+                    .iter()
+                    .find_map(|line| line.strip_prefix("Offset = "))
+                    .map(str::parse)
+                    .transpose()?
+                    .unwrap_or(0);
+                Some(size.checked_add(offset).context("7z 压缩包大小无效")?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let count = if rar_volumes || split_7z_end.is_some() {
             properties
                 .iter()
                 .find_map(|line| line.strip_prefix("Volumes = "))
-                .context("7-Zip 未报告 RAR 分卷数")?
+                .context("7-Zip 未报告分卷数")?
                 .parse()
-                .context("7-Zip 报告的 RAR 分卷数无效")?
+                .context("7-Zip 报告的分卷数无效")?
         } else {
             1
         };
         return Ok(Some(ArchiveInfo {
             encrypted: stdout.lines().any(|line| line == "Encrypted = +"),
             volumes: Some(count),
+            split_7z_end,
         }));
     }
 
@@ -214,6 +260,7 @@ fn inspect_archive(archive: &Path, password: Option<&str>) -> Result<Option<Arch
         return Ok(Some(ArchiveInfo {
             encrypted: true,
             volumes: None,
+            split_7z_end: None,
         }));
     }
     if is_image_file(archive) && stderr.contains("open the file as archive") {

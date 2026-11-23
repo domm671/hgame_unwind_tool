@@ -16,6 +16,15 @@ pub fn is_archive_file(path: &Path) -> bool {
     )
 }
 
+pub fn is_first_7z_volume(path: &Path) -> bool {
+    path.extension() == Some(OsStr::new("001"))
+        && path
+            .file_stem()
+            .and_then(|stem| Path::new(stem).extension())
+            .and_then(OsStr::to_str)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("7z"))
+}
+
 pub fn rar_volume_name(path: &Path) -> Option<(&str, usize)> {
     if !path.extension()?.to_str()?.eq_ignore_ascii_case("rar") {
         return None;
